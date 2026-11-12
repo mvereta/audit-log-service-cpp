@@ -446,6 +446,127 @@ class PaginationWindowTests(ApiTest):
         self.assertEqual(journal["content"][1:], original)
 
 
+class SnapshotQueryTests(ApiTest):
+    def setUp(self):
+        self.actor = f"snapshot-{uuid.uuid4().hex}@example.test"
+        # Reverse time relative to allocation order: the highest initial ID
+        # must not be inferred from the first page sorted by time.
+        self.service.sql(
+            "insert into audit_events (recorded_at, actor, action, outcome) "
+            "select '2000-01-01T00:00:00Z'::timestamptz + (7 - n) * interval '1 second', "
+            f"'{self.actor}', case when n % 2 = 0 then 'LOGIN' else 'LOGOUT' end, "
+            "case when n % 3 = 0 then 'DENIED' else 'ALLOWED' end "
+            "from generate_series(0, 7) as fixture(n) order by n"
+        )
+        initial = self.query(actor=self.actor, page=0, size=200)
+        self.original = initial["content"]
+        self.assertEqual(len(self.original), initial["totalElements"])
+        self.assertGreater(len(self.original), 3)
+        self.boundary = max(event["id"] for event in self.original)
+
+    def assert_bounded_walk(self, expected, boundary, size=3, **filters):
+        pages = (len(expected) + size - 1) // size
+        observed = []
+        for index in range(pages + 1):
+            page = self.query(snapshotId=boundary, page=index, size=size, **filters)
+            self.assertEqual(set(page), {"content", "page", "size", "totalElements"})
+            self.assertEqual((page["page"], page["size"]), (index, size))
+            self.assertEqual(page["totalElements"], len(expected))
+            self.assertEqual(page["content"], expected[index * size:(index + 1) * size])
+            self.assertTrue(all(event["id"] <= boundary for event in page["content"]))
+            observed.extend(page["content"])
+        self.assertEqual(observed, expected)
+
+    def test_same_boundary_preserves_traversal_across_appends(self):
+        first = self.query(actor=self.actor, snapshotId=self.boundary, page=0, size=3)
+        self.assertGreater(self.boundary, max(event["id"] for event in first["content"]))
+        self.assert_bounded_walk(self.original, self.boundary, actor=self.actor)
+
+        created_ids = set()
+        for _ in range(2):
+            status, _, created = self.service.request("POST", body=AppendTests.event(actor=self.actor))
+            self.assertEqual(status, 201, created)
+            self.assertGreater(created["id"], self.boundary)
+            created_ids.add(created["id"])
+
+        second = self.query(actor=self.actor, snapshotId=self.boundary, page=1, size=3)
+        self.assertEqual(second["content"], self.original[3:6])
+        self.assertEqual(second["totalElements"], first["totalElements"])
+        self.assertTrue({event["id"] for event in first["content"]}.isdisjoint(
+            event["id"] for event in second["content"]))
+        self.assert_bounded_walk(self.original, self.boundary, actor=self.actor)
+
+        live = self.query(actor=self.actor, page=0, size=200)
+        self.assertEqual(live["totalElements"], len(self.original) + len(created_ids))
+        self.assertEqual({event["id"] for event in live["content"]},
+                         {event["id"] for event in self.original} | created_ids)
+
+    def test_boundary_combines_with_existing_filters_for_content_and_count(self):
+        boundary = sorted(event["id"] for event in self.original)[4]
+        status, _, created = self.service.request("POST", body=AppendTests.event(actor=self.actor))
+        self.assertEqual(status, 201, created)
+        self.assertGreater(created["id"], boundary)
+        window = {"from": "2000-01-01T00:00:02Z", "to": "2100-01-01T00:00:00Z"}
+        combinations = ({}, {"action": "LOGIN"}, {"outcome": "ALLOWED"},
+                        {"action": "LOGIN", "outcome": "ALLOWED"},
+                        {"from": window["from"]}, {"to": window["to"]}, window,
+                        {**window, "action": "LOGIN", "outcome": "ALLOWED"})
+        for filters in combinations:
+            with self.subTest(filters=filters):
+                expected = [event for event in self.original
+                            if event["id"] <= boundary
+                            and all(event[key] == filters[key] for key in ("action", "outcome") if key in filters)
+                            and ("from" not in filters or event["recordedAt"] >= filters["from"])
+                            and ("to" not in filters or event["recordedAt"] < filters["to"])]
+                # size=1 forces full pages to exercise SELECT count(*);
+                # size=3 also covers the inferred total on partial pages.
+                for size in (1, 3):
+                    self.assert_bounded_walk(expected, boundary, size=size, actor=self.actor, **filters)
+
+    def test_equal_timestamps_are_ordered_by_id_descending(self):
+        self.service.sql(
+            "insert into audit_events (recorded_at, actor, action, outcome) "
+            f"select '2001-01-01T00:00:00Z', '{self.actor}', 'LOGIN', 'ALLOWED' "
+            "from generate_series(1, 4)"
+        )
+        filters = {"actor": self.actor, "from": "2001-01-01T00:00:00Z", "to": "2002-01-01T00:00:00Z"}
+        live = self.query(**filters, page=0, size=200)
+        rows = live["content"]
+        self.assertGreater(len(rows), 1)
+        self.assertEqual(len(rows), live["totalElements"])
+        self.assertEqual(len({event["recordedAt"] for event in rows}), 1)
+        expected = sorted(rows, key=lambda event: event["id"], reverse=True)
+        self.assertEqual(rows, expected)
+        for index, event in enumerate(expected):
+            page = self.query(**filters, page=index, size=1)
+            self.assertEqual(page["content"], [event])
+            self.assertEqual(page["totalElements"], len(expected))
+        boundary = expected[1]["id"]
+        self.assert_bounded_walk([event for event in expected if event["id"] <= boundary],
+                                 boundary, size=1, **filters)
+
+    def test_snapshot_integer_validation_and_blank_actor_behavior(self):
+        for value in ("invalid", "1.5", "9223372036854775808", "-9223372036854775809"):
+            with self.subTest(value=value):
+                status, _, error = self.service.request(params={"snapshotId": value})
+                self.assertEqual(status, 400, error)
+                self.assertIn("snapshotId", error["message"])
+        for value in (0, -1, -9223372036854775808, "-0x8000000000000000"):
+            with self.subTest(value=value):
+                self.assert_bounded_walk([], value, actor=self.actor)
+        for value in (9223372036854775807, 1 << 40, f"+{self.boundary}",
+                      f" #{self.boundary:x} ", "", " \t "):
+            with self.subTest(value=value):
+                page = self.query(actor=self.actor, snapshotId=value, page=0, size=200)
+                self.assertEqual(page["content"], self.original)
+                self.assertEqual(page["totalElements"], len(self.original))
+
+        bounded = self.query(snapshotId=self.boundary, page=0, size=200)
+        for actor in ("", " \t\u2003 "):
+            with self.subTest(actor=actor):
+                self.assertEqual(self.query(actor=actor, snapshotId=self.boundary, page=0, size=200), bounded)
+
+
 class DatabaseTimestampTests(ApiTest):
     def test_extended_year_rows_round_trip(self):
         actor = "timestamp-era@example.test"
@@ -469,7 +590,7 @@ def main():
     with database() as service, running_service(service, binary):
         ApiTest.service = service
         suite = unittest.TestSuite()
-        for case in (QueryTests, PaginationWindowTests, AppendTests, DatabaseTimestampTests):
+        for case in (QueryTests, PaginationWindowTests, AppendTests, DatabaseTimestampTests, SnapshotQueryTests):
             suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 

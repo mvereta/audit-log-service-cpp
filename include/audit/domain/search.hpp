@@ -17,10 +17,12 @@ struct Search {
     std::optional<Outcome> outcome;
     std::int32_t page;
     std::int32_t size;
+    std::optional<std::int64_t> snapshot_id;
 
     Search(std::optional<std::string> actor, std::optional<Instant> from, std::optional<Instant> to,
            std::optional<Action> action, std::optional<Outcome> outcome,
-           std::int32_t page, std::int32_t size);
+           std::int32_t page, std::int32_t size,
+           std::optional<std::int64_t> snapshot_id = std::nullopt);
 };
 
 }
