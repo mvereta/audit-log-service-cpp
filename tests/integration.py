@@ -16,6 +16,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -369,6 +370,82 @@ class AppendTests(ApiTest):
         self.assertEqual(self.service.sql("select actor from audit_events where id=1").stdout.strip(), "alice@example.com")
 
 
+class PaginationWindowTests(ApiTest):
+    def setUp(self):
+        # Isolate each scenario from seeds and other tests. Fixture timestamps
+        # are distinct and in the past; all observations go through HTTP.
+        actor = f"pagination-{uuid.uuid4().hex}@example.test"
+        self.filters = {"actor": actor, "action": "LOGIN", "outcome": "ALLOWED"}
+        self.service.sql(
+            "insert into audit_events (recorded_at, actor, action, outcome) "
+            f"select '2000-01-01T00:00:00Z'::timestamptz + n * interval '1 second', "
+            f"'{actor}', 'LOGIN', 'ALLOWED' from generate_series(0, 5) as fixture(n)"
+        )
+
+    def snapshot(self):
+        page = self.query(**self.filters, page=0, size=200)
+        self.assertEqual(len(page["content"]), page["totalElements"])
+        return page
+
+    def test_adjacent_pages_without_append_do_not_overlap(self):
+        baseline = self.snapshot()
+        original = baseline["content"]
+        size = 3
+        self.assertGreaterEqual(len(original), 2 * size)
+        self.assertEqual(len({event["recordedAt"] for event in original}), len(original))
+
+        first = self.query(**self.filters, page=0, size=size)
+        second = self.query(**self.filters, page=1, size=size)
+        for index, page in enumerate((first, second)):
+            self.assertEqual((page["page"], page["size"]), (index, size))
+            self.assertEqual(page["totalElements"], baseline["totalElements"])
+            self.assertEqual(page["content"], original[index * size:(index + 1) * size])
+        self.assertTrue(
+            {event["id"] for event in first["content"]}.isdisjoint(
+                event["id"] for event in second["content"]
+            )
+        )
+        self.assertEqual(self.snapshot()["content"], original)
+
+    def test_append_between_pages_shifts_window_without_removing_events(self):
+        baseline = self.snapshot()
+        original = baseline["content"]
+        size = 3
+        self.assertGreaterEqual(len(original), 2 * size)
+        self.assertEqual(len({event["recordedAt"] for event in original}), len(original))
+        first = self.query(**self.filters, page=0, size=size)
+        self.assertEqual((first["page"], first["size"]), (0, size))
+        self.assertEqual(first["totalElements"], baseline["totalElements"])
+        self.assertEqual(first["content"], original[:size])
+
+        status, _, created = self.service.request("POST", body=AppendTests.event(**self.filters))
+        self.assertEqual(status, 201, created)
+        self.assertNotIn(created["id"], {event["id"] for event in original})
+
+        def recorded(event):
+            return datetime.datetime.fromisoformat(event["recordedAt"].replace("Z", "+00:00"))
+
+        self.assertGreater(recorded(created), max(recorded(event) for event in original))
+
+        second = self.query(**self.filters, page=1, size=size)
+        self.assertEqual((second["page"], second["size"]), (1, size))
+        self.assertEqual(second["totalElements"], first["totalElements"] + 1)
+        self.assertEqual(second["content"], original[size - 1:2 * size - 1])
+        repeated = {event["id"] for event in first["content"]} & {
+            event["id"] for event in second["content"]
+        }
+        self.assertEqual(repeated, {first["content"][-1]["id"]})
+
+        journal = self.snapshot()
+        self.assertEqual(journal["totalElements"], baseline["totalElements"] + 1)
+        # PostgreSQL can round the POST timestamp to microseconds on storage.
+        self.assertEqual(journal["content"][0]["id"], created["id"])
+        self.assertGreater(recorded(journal["content"][0]), max(recorded(event) for event in original))
+        # Re-read the whole filtered journal: the shifted tail and every
+        # previously read event must still exist, with their original data.
+        self.assertEqual(journal["content"][1:], original)
+
+
 class DatabaseTimestampTests(ApiTest):
     def test_extended_year_rows_round_trip(self):
         actor = "timestamp-era@example.test"
@@ -392,7 +469,7 @@ def main():
     with database() as service, running_service(service, binary):
         ApiTest.service = service
         suite = unittest.TestSuite()
-        for case in (QueryTests, AppendTests, DatabaseTimestampTests):
+        for case in (QueryTests, PaginationWindowTests, AppendTests, DatabaseTimestampTests):
             suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
